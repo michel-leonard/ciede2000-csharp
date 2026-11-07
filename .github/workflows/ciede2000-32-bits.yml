@@ -1,0 +1,127 @@
+name: C# CIEDE2000 Testing (32 bits)
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 10000000
+  precision: 3
+
+jobs:
+  test-implementation-de00-cs-32-bits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v7
+
+      - name: 📦 Set up .NET and GCC
+        run: |
+          command -v dotnet > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes dotnet-sdk-8.0 ; }
+          command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+
+      - name: 🔧 Create csproj and C# Driver
+        run: |
+          printf '%s\n' \
+          '<Project Sdk="Microsoft.NET.Sdk">' \
+          '  <PropertyGroup>' \
+          '    <OutputType>Exe</OutputType>' \
+          '    <TargetFramework>net8.0</TargetFramework>' \
+          '    <ImplicitUsings>enable</ImplicitUsings>' \
+          '    <Nullable>enable</Nullable>' \
+          '  </PropertyGroup>' \
+          '  <ItemGroup>' \
+          '    <Compile Remove="ciede2000-32-bits.cs" />' \
+          '    <Compile Remove="ciede2000-64-bits.cs" />' \
+          '  </ItemGroup>' \
+          '</Project>' > delta-e-2000.csproj
+
+          printf '%s\n' \
+          'using System;' \
+          'using System.IO;' \
+          'using System.Globalization;' \
+          'class CIEDriver {' '' > Driver.cs
+
+          cat ciede2000-32-bits.cs >> Driver.cs
+          
+          printf '%s\n' '' \
+          '	static void Main(string[] args) {' \
+          '		if (args.Length < 2) return;' \
+          '		bool canonical = args.Length > 2;' \
+          '		using var sr = new StreamReader(args[0]);' \
+          '		using var sw = new StreamWriter(args[1]);' \
+          '		string line;' \
+          '		while ((line = sr.ReadLine()) != null) {' \
+          '			var p = line.Split(",");' \
+          '			float res = ciede2000(' \
+          '				float.Parse(p[0], CultureInfo.InvariantCulture),' \
+          '				float.Parse(p[1], CultureInfo.InvariantCulture),' \
+          '				float.Parse(p[2], CultureInfo.InvariantCulture),' \
+          '				float.Parse(p[3], CultureInfo.InvariantCulture),' \
+          '				float.Parse(p[4], CultureInfo.InvariantCulture),' \
+          '				float.Parse(p[5], CultureInfo.InvariantCulture),' \
+          '				float.Parse(p[6], CultureInfo.InvariantCulture),' \
+          '				float.Parse(p[7], CultureInfo.InvariantCulture),' \
+          '				float.Parse(p[8], CultureInfo.InvariantCulture),' \
+          '				canonical' \
+          '			);' \
+          '			sw.WriteLine(line + "," + res.ToString("R", CultureInfo.InvariantCulture));' \
+          '		}' \
+          '	}' \
+          '}' '' >> Driver.cs
+
+      - name: ⚙️ Compile C# project
+        run: dotnet publish -c Release -o ./dist
+
+      - name: 🌐️ Download the CIEDE2000 driver program
+        run: |
+         wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-native-precision-driver.c
+         wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-dataset-generator-32-bits.c
+
+      - name: ⚙️ Compile the CIEDE2000 driver program in C99
+        run: |
+         gcc --version
+         # Replace 1E-14 with 1E-6 in the source code of the ciede2000 function for 32-bit testing
+         sed -i 's/1E-14/1E-6/g' ciede2000-native-precision-driver.c
+         gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-native-precision-driver.c -o ciede2000-native -lm
+         gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-dataset-generator-32-bits.c -o ciede2000-data-generator
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: |
+         SEED=$(head -c 8 /dev/urandom | od -An -tu8 | tr -d ' ')
+         echo "Generate data using seed $SEED"
+         ./ciede2000-data-generator --number $n_csv_lines --seed $SEED > test-cases.csv
+
+      - name: 🚀 Run test cases in C# and submit them to the verifier
+        run: |
+          export DOTNET_gcServer=0
+          dotnet dist/delta-e-2000.dll test-cases.csv calc-canonical.csv --canonical &
+          dotnet dist/delta-e-2000.dll test-cases.csv calc-simplified.csv &
+          wait
+          ./ciede2000-native --precision $precision -i calc-canonical.csv --canonical -o summary-canonical.txt &
+          ./ciede2000-native --precision $precision -i calc-simplified.csv -o summary-simplified.txt &
+          wait
+          echo "Temporary File Details:"
+          du -h calc-*
+          wc -l calc-*
+          rm calc-*
+
+      - name: 🏁 Conclusion
+        run: |
+          for compliance in simplified canonical; do
+            file="summary-$compliance.txt"
+            cat "$file"
+            #
+            if [ "${file%canonical.txt}" = "$file" ]; then
+              Q1="[ ] CANONICAL [X] SIMPLIFIED"
+            else
+              Q1="[X] CANONICAL [ ] SIMPLIFIED"
+            fi
+            if grep -Fq "$Q1" "$file" && grep -Fq "Error : 0" "$file" && grep -Fq "Successes : $n_csv_lines" "$file"; then
+              echo "✔️ Verification of $file successful: all $n_csv_lines color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+            fi
+          done
